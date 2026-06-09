@@ -1,0 +1,14 @@
+torch
+diffusers>=0.30
+transformers
+datasets
+accelerate
+numpy
+scipy
+matplotlib
+pandas
+Pillow
+tqdm
+huggingface_hub
+pyvis
+ipython

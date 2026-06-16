@@ -1,8 +1,8 @@
 # DifFRACT: Diffusion Feature Reconstruction and Attribution for Circuit Tracing
 
-<a href="TODO"><img src="https://img.shields.io/badge/Paper-PDF-b31b1b.svg" height=22.5></a>
+<a href="https://arxiv.org/abs/2606.15796"><img src="https://img.shields.io/badge/Paper-PDF-b31b1b.svg" height=22.5></a>
 <a href="https://huggingface.co/Artalmaz31/DifFRACT"><img src="https://img.shields.io/badge/🤗-Weights-yellow" height=22.5></a>
-<a href="https://colab.research.google.com/github/TODO/blob/main/walkthrough.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" height=22.5></a>
+<a href="https://colab.research.google.com/github/Artalmaz31/DifFRACT/blob/main/walkthrough.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" height=22.5></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green" height=22.5></a>
 
 <p align="center">
@@ -10,7 +10,7 @@
 </p>
 
 This is the code accompanying the paper *DifFRACT: Diffusion Feature Reconstruction and Attribution
-for Circuit Tracing* ([PDF](TODO)). It targets a multimodal diffusion transformer (MM-DiT) with two
+for Circuit Tracing* ([PDF](https://arxiv.org/abs/2606.15796)). It targets a multimodal diffusion transformer (MM-DiT) with two
 residual streams — an **image** stream and a **text** stream — so every transcoder, feature and
 graph node is tagged with the stream it belongs to.
 
@@ -98,13 +98,16 @@ The two libraries used by these notebooks, [`transcoder_training/`](transcoder_t
 
 ## Citation
 
-If our work assists your research, feel free to give us a star ⭐ or cite us using:
+If our work assists your research, feel free to give us a star and cite us using:
 
 ```bibtex
-@article{diffract2026,
-  title   = {DifFRACT: Diffusion Feature Reconstruction and Attribution for Circuit Tracing},
-  author  = {TODO},
-  journal = {TODO},
-  year    = {2026}
+@misc{mazur2026diffractdiffusionfeaturereconstruction,
+      title={DifFRACT: Diffusion Feature Reconstruction and Attribution for Circuit Tracing}, 
+      author={Artyom Mazur and Nina Konovalova and Aibek Alanov},
+      year={2026},
+      eprint={2606.15796},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2606.15796}, 
 }
 ```

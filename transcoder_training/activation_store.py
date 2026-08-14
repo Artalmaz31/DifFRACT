@@ -1,17 +1,20 @@
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Tuple
 import torch
 
 
 class TimestepContext:
     """Holds the current denoising timestep, set by a transformer forward pre-hook."""
 
-    def __init__(self):
+    def __init__(self, scale: float = 1.0):
+        self.scale = float(scale)
         self.t = None
         self.t_cpu = None
 
     @torch.no_grad()
     def set(self, t):
         t = t.detach().to(dtype=torch.float32)
+        if self.scale != 1.0:
+            t = t / self.scale
         self.t = t
         self.t_cpu = t.to("cpu", dtype=torch.float32)
 
@@ -28,43 +31,43 @@ def install_timestep_hook(pipe, t_ctx: TimestepContext):
 
 
 def make_buffers(
-    target_layers: Sequence[int],
+    keys: Sequence[Tuple[str, int]],
     d_model: int,
     buffer_size: int,
     buffer_dtype: torch.dtype,
 ) -> Dict[str, dict]:
-    """Allocate per-(layer, stream) pinned replay buffers of (x, y, t) records."""
+    """Allocate per-(stream, layer) pinned replay buffers of (x, y, t) records."""
     buffers: Dict[str, dict] = {}
-    for l in target_layers:
-        for stream in ("img", "txt"):
-            buffers[f"{stream}_{l}"] = {
-                "x": torch.empty(
-                    (buffer_size, d_model), dtype=buffer_dtype
-                ).pin_memory(),
-                "y": torch.empty(
-                    (buffer_size, d_model), dtype=buffer_dtype
-                ).pin_memory(),
-                "t": torch.empty((buffer_size,), dtype=torch.float32).pin_memory(),
-                "ptr": 0,
-            }
+    for stream, layer in keys:
+        buffers[f"{stream}_{layer}"] = {
+            "x": torch.empty((buffer_size, d_model), dtype=buffer_dtype).pin_memory(),
+            "y": torch.empty((buffer_size, d_model), dtype=buffer_dtype).pin_memory(),
+            "t": torch.empty((buffer_size,), dtype=torch.float32).pin_memory(),
+            "ptr": 0,
+        }
     return buffers
+
+
+def reset_buffers(buffers: Dict[str, dict]) -> None:
+    for buf in buffers.values():
+        buf["ptr"] = 0
 
 
 class DualStreamCapture:
     """Forward hooks capturing (x, MLP(x), t) for both streams of each target block."""
 
-    def __init__(self, pipe, layers, buffers, buffer_dtype, t_ctx: TimestepContext):
+    def __init__(self, pipe, keys, buffers, buffer_dtype, t_ctx: TimestepContext):
         self.hooks = []
         self.enabled = True
         self.buffers = buffers
         self.buffer_dtype = buffer_dtype
         self.t_ctx = t_ctx
 
-        for l in layers:
-            blk = pipe.transformer.transformer_blocks[l]
-            self.hooks.append(blk.ff.register_forward_hook(self.make_hook(f"img_{l}")))
+        blocks = pipe.transformer.transformer_blocks
+        for stream, layer in keys:
+            module = blocks[layer].ff if stream == "img" else blocks[layer].ff_context
             self.hooks.append(
-                blk.ff_context.register_forward_hook(self.make_hook(f"txt_{l}"))
+                module.register_forward_hook(self.make_hook(f"{stream}_{layer}"))
             )
 
     def make_hook(self, key):

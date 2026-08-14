@@ -179,21 +179,22 @@ def load_transcoders(
     transcoder_dir: str,
     layers: Sequence[int],
     *,
-    d_model: int = 3072,
-    expansion_factor: int = 16,
-    time_embed_dim: int = 256,
+    d_model: int,
+    expansion_factor: int,
+    time_embed_dim: int,
     streams: Sequence[str] = ("img", "txt"),
     device="cpu",
     dtype=torch.float32,
     requires_grad: bool = False,
     skip_missing: bool = False,
+    prefix: str = "transcoder",
 ) -> dict:
     """Load trained transcoders into a {f"{stream}_{layer}": module} dict."""
     transcoders = {}
     for layer in layers:
         for stream in streams:
             key = f"{stream}_{layer}"
-            path = os.path.join(transcoder_dir, f"transcoder_{key}.pt")
+            path = os.path.join(transcoder_dir, f"{prefix}_{key}.pt")
             if skip_missing and not os.path.exists(path):
                 continue
             tc = TemporalAwareTranscoder(

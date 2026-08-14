@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from datasets import load_dataset
 
 
@@ -10,10 +10,11 @@ class PromptStream:
         dataset_id: str,
         column: str = "prompt",
         split: str = "train",
-        config_name: str = "default",
+        config_name: Optional[str] = "default",
         min_len: int = 16,
         max_len: int = 512,
     ):
+        self.dataset_id = dataset_id
         self.column = column
         self.min_len = min_len
         self.max_len = max_len
@@ -29,17 +30,16 @@ class PromptStream:
                 self._iter = iter(self.dataset)
                 continue
             txt = item.get(self.column, "")
-            if txt and len(txt) >= self.min_len:
+            if txt and len(txt) > self.min_len:
                 out.append(txt[: self.max_len])
         return out
 
     def fixed_validation_batch(self, n: int = 512) -> List[str]:
-        """A deterministic held-out batch drawn from the front of the dataset."""
         out: List[str] = []
         for item in self.dataset:
             if len(out) >= n:
                 break
             txt = item.get(self.column, "")
-            if txt and len(txt) >= self.min_len:
+            if txt and len(txt) > self.min_len:
                 out.append(txt[: self.max_len])
         return out

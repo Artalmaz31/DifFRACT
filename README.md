@@ -61,12 +61,31 @@ To train the timestep-conditioned transcoders yourself (MLP **input → output**
 python train_transcoder.py --layers $(seq 0 15) --save-dir ./output
 ```
 
-Key flags: `--layers` (double-stream block indices, both `img` and `txt` streams trained per layer;
+Key flags: `--layers` (block indices, both `img` and `txt` streams trained per layer;
 default `6 12 18`), `--save-dir` (checkpoint output dir), `--dataset-id` (HF prompt corpus, default
 `yvdao/midjourney-v6`), `--l1-img` / `--l1-txt` (sparsity coefficients, default `3e-4` / `5e-5`),
 `--cycles`, `--buffer-size`, `--batch-size`, `--device`. Checkpoints are written to
 `{save-dir}/best/transcoder_{stream}_{layer}.pt` (best by validation cosine) and `{save-dir}/last/`;
 point `TRANSCODERS_DIR` at `{save-dir}/best` to use them.
+
+### Other backbones
+
+`--model` selects the architecture:
+
+| `--model` | Backbone |
+|---|---|
+| `flux-schnell` *(default)* | FLUX.1-schnell |
+| `flux-dev` | FLUX.1-dev |
+| `sd3-medium` | StableDiffusion 3 Medium |
+| `sd3.5-medium` | StableDiffusion 3.5 Medium |
+
+```bash
+python train_transcoder.py --model sd3-medium --layers 6 12 18 --save-dir ./output_sd3
+```
+
+Use `--model-id` to point at a local snapshot instead of the Hub (offline runners).
+
+### SAEs
 
 To train the SAE baseline (identical architecture, but autoencodes the MLP **output → output**, so
 its reconstruction error is comparable to a transcoder's), run:

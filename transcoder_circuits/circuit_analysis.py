@@ -1,5 +1,3 @@
-"""Public API for circuit analysis."""
-
 from .attribution_graph import (
     NodeType,
     NodeId,
@@ -17,11 +15,23 @@ from .influence import (
     normalized_adjacency,
     indirect_influence,
 )
+from .backends import (
+    TracingSpec,
+    TRACING_ARCHS,
+    Backend,
+    get_backend,
+    get_spec,
+)
 from .tracing import ExpansionConfig, CircuitTracer
 from .pruning import GraphPruner
-from .pipeline import FluxLRMPipeline, infer_position_for_feature
+from .pipeline import LRMPipeline, infer_position_for_feature
 
 __all__ = [
+    "TracingSpec",
+    "TRACING_ARCHS",
+    "Backend",
+    "get_backend",
+    "get_spec",
     "NodeType",
     "NodeId",
     "EdgeData",
@@ -39,6 +49,6 @@ __all__ = [
     "ExpansionConfig",
     "CircuitTracer",
     "GraphPruner",
-    "FluxLRMPipeline",
+    "LRMPipeline",
     "infer_position_for_feature",
 ]

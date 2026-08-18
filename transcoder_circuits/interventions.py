@@ -3,12 +3,14 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Set
 import torch
 import torch.nn as nn
+from torch import Tensor
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from diffusers.models.embeddings import get_timestep_embedding
 from IPython.display import display
 import logging
 import matplotlib
+from .backends import Backend, get_backend
 
 matplotlib.use("Agg")
 logging.getLogger("diffusers").setLevel(logging.ERROR)
@@ -117,9 +119,13 @@ class MultiFeatureController:
         pipe,
         transcoders: Dict[str, nn.Module],
         interventions: List[FeatureIntervention],
+        backend: Backend,
         stream_interventions: Optional[List[StreamIntervention]] = None,
         height: int = 512,
         width: int = 512,
+        timestep_scale: float = 1.0,
+        cfg_branch: str = "both",
+        guidance_scale: Optional[float] = None,
     ):
         self.pipe = pipe
         self.transcoders = transcoders
@@ -127,6 +133,17 @@ class MultiFeatureController:
         self.stream_interventions = stream_interventions or []
         self.height = height
         self.width = width
+        self.backend = backend
+        self.timestep_scale = float(timestep_scale)
+        self.guidance_scale = (
+            backend.spec.guidance_scale if guidance_scale is None else guidance_scale
+        )
+        self._real_cfg = backend.runs_real_cfg(self.guidance_scale)
+        if cfg_branch not in ("both", "cond", "uncond"):
+            raise ValueError(
+                f"cfg_branch must be 'both', 'cond' or 'uncond', got {cfg_branch!r}"
+            )
+        self.cfg_branch = cfg_branch
 
         self.step_call_idx = -1
         self.current_timestep = None
@@ -148,8 +165,22 @@ class MultiFeatureController:
 
     def _on_transformer_pre(self, module, args, kwargs):
         self.step_call_idx += 1
-        self.current_timestep = kwargs.get("timestep", None)
+        t = kwargs.get("timestep", None)
+        self.current_timestep = None if t is None else t / self.timestep_scale
         return None
+
+    def _branch_rows(self, batch: int, device) -> Optional[Tensor]:
+        if not self._real_cfg or self.cfg_branch == "both":
+            return None
+        if batch < 2 or batch % 2 != 0:
+            return None
+        half = batch // 2
+        rows = torch.zeros(batch, dtype=torch.bool, device=device)
+        if self.cfg_branch == "uncond":
+            rows[:half] = True
+        else:
+            rows[half:] = True
+        return rows.view(batch, 1)
 
     @torch.no_grad()
     def forward_transcoder_ff(self, key, stream, x):
@@ -181,6 +212,8 @@ class MultiFeatureController:
                 tc.cpu()
             return rec.to(dtype=x.dtype)
 
+        row_mask = self._branch_rows(B, x.device)
+
         # Modulate input
         x_enc = x.to(dtype=tc.encoder.weight.dtype)
         t_float = t.to(dtype=torch.float32, device=x.device).view(-1)
@@ -205,7 +238,10 @@ class MultiFeatureController:
             z = F.relu(F.linear(x_mod, Wenc, benc))
 
             if stream_zero_this_step:
-                z.zero_()
+                if row_mask is None:
+                    z.zero_()
+                else:
+                    z = torch.where(row_mask.unsqueeze(-1), torch.zeros_like(z), z)
             else:
                 # Apply feature-level interventions
                 for intv in active_intvs:
@@ -219,6 +255,9 @@ class MultiFeatureController:
                             mask = zf > (zmax * intv.token_threshold)
                         else:
                             mask = torch.ones_like(zf, dtype=torch.bool)
+
+                        if row_mask is not None:
+                            mask = mask & row_mask
 
                         if intv.mode == "zero":
                             zf_new = torch.zeros_like(zf)
@@ -254,24 +293,25 @@ class MultiFeatureController:
         )
 
         # Patch each (layer, stream) that has interventions
-        for key in self._all_keys:
-            parts = key.split("_")
-            stream = parts[0]
-            layer = int(parts[1])
+        try:
+            for key in self._all_keys:
+                parts = key.split("_")
+                stream = parts[0]
+                layer = int(parts[1])
 
-            if key not in self.transcoders:
-                print(f"  WARNING: no transcoder for {key}, skipping")
-                continue
+                if key not in self.transcoders:
+                    print(f"WARNING: no transcoder for {key}, skipping")
+                    continue
 
-            blk = self.pipe.transformer.transformer_blocks[layer]
-            replacement = _MultiReplaceFF(self, key=key, stream=stream)
+                blk = self.backend.blocks(self.pipe.transformer)[layer]
+                replacement = _MultiReplaceFF(self, key=key, stream=stream)
 
-            if stream == "img":
-                self.originals[key] = blk.ff
-                blk.ff = replacement
-            elif stream == "txt":
-                self.originals[key] = blk.ff_context
-                blk.ff_context = replacement
+                attr = "ff" if stream == "img" else "ff_context"
+                self.originals[key] = getattr(blk, attr)
+                setattr(blk, attr, replacement)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
 
         return self
 
@@ -281,11 +321,8 @@ class MultiFeatureController:
             parts = key.split("_")
             stream = parts[0]
             layer = int(parts[1])
-            blk = self.pipe.transformer.transformer_blocks[layer]
-            if stream == "img":
-                blk.ff = orig
-            elif stream == "txt":
-                blk.ff_context = orig
+            blk = self.backend.blocks(self.pipe.transformer)[layer]
+            setattr(blk, "ff" if stream == "img" else "ff_context", orig)
 
         # Remove hooks
         for h in self.hooks:
@@ -307,6 +344,10 @@ class InterventionRunner:
         height: int = 512,
         width: int = 512,
         num_inference_steps: int = 4,
+        backend: str = "flux-schnell",
+        guidance_scale: Optional[float] = None,
+        timestep_scale: Optional[float] = None,
+        cfg_branch: str = "both",
     ):
         self.pipe = pipe
         self.transcoders = transcoders
@@ -314,19 +355,44 @@ class InterventionRunner:
         self.height = height
         self.width = width
         self.num_inference_steps = num_inference_steps
+        self.backend = get_backend(backend)
+        spec = self.backend.spec
+        self.guidance_scale = (
+            spec.guidance_scale if guidance_scale is None else guidance_scale
+        )
+        self.timestep_scale = (
+            spec.timestep_scale if timestep_scale is None else timestep_scale
+        )
+        self.cfg_branch = cfg_branch
+
+    @classmethod
+    def from_config(cls, pipe, transcoders, cfg, **overrides) -> "InterventionRunner":
+        kwargs = dict(
+            device=cfg.device,
+            height=cfg.height,
+            width=cfg.width,
+            num_inference_steps=cfg.num_inference_steps,
+            backend=cfg.backend,
+            guidance_scale=cfg.guidance_scale,
+            timestep_scale=cfg.timestep_scale,
+        )
+        kwargs.update(overrides)
+        return cls(pipe, transcoders, **kwargs)
+
+    def _call_kwargs(self, prompt: str) -> Dict[str, Any]:
+        return self.backend.generation_kwargs(prompt, self.guidance_scale)
 
     @torch.inference_mode()
     def _generate(self, prompt: str, seed: int) -> Image.Image:
         gen = torch.Generator(device=self.device).manual_seed(seed)
         out = self.pipe(
             prompt,
-            prompt_2=prompt,
             height=self.height,
             width=self.width,
             num_inference_steps=self.num_inference_steps,
-            guidance_scale=0.0,
             output_type="pil",
             generator=gen,
+            **self._call_kwargs(prompt),
         )
         return out.images[0]
 
@@ -345,17 +411,20 @@ class InterventionRunner:
             stream_interventions=stream_interventions,
             height=self.height,
             width=self.width,
+            backend=self.backend,
+            timestep_scale=self.timestep_scale,
+            cfg_branch=self.cfg_branch,
+            guidance_scale=self.guidance_scale,
         ):
             gen = torch.Generator(device=self.device).manual_seed(seed)
             out = self.pipe(
                 prompt,
-                prompt_2=prompt,
                 height=self.height,
                 width=self.width,
                 num_inference_steps=self.num_inference_steps,
-                guidance_scale=0.0,
                 output_type="pil",
                 generator=gen,
+                **self._call_kwargs(prompt),
             )
         return out.images[0]
 

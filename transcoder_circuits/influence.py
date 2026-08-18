@@ -1,7 +1,4 @@
-"""Indirect-influence linear algebra shared across tracing, pruning and validation."""
-
 from typing import Dict, List, Tuple
-
 import numpy as np
 
 

@@ -14,9 +14,10 @@ for Circuit Tracing* ([PDF](https://arxiv.org/abs/2606.15796)). It targets a mul
 residual streams — an **image** stream and a **text** stream — so every transcoder, feature and
 graph node is tagged with the stream it belongs to.
 
-This repository contains tools for understanding what happens inside the
-[FLUX.1[schnell]](https://huggingface.co/black-forest-labs/FLUX.1-schnell) text-to-image
-diffusion transformer by using **timestep-conditioned transcoders**. A transcoder decomposes
+This repository contains tools for understanding what happens inside
+[FLUX.1[schnell]](https://huggingface.co/black-forest-labs/FLUX.1-schnell) — the backbone
+used throughout the paper — and, with the same machinery, inside FLUX.1[dev],
+StableDiffusion 3 Medium and StableDiffusion 3.5 Medium. A transcoder decomposes
 an MLP sublayer into a sparse linear combination of interpretable features; conditioning it on
 the denoising timestep lets a single transcoder track how a feature's behaviour changes across
 the diffusion trajectory. By substituting transcoders into a frozen **Local Replacement Model**,
@@ -51,7 +52,7 @@ given behaviour — and intervene on them.
    walkthrough and case studies, plus the 6 SAE baselines (`temporal-aware-saes/`, layers 6/12/18)
    for the sparsity–faithfulness comparison.
 
-3. Work through [`walkthrough.ipynb`](walkthrough.ipynb): it loads FLUX, builds the Local
+3. Work through [`walkthrough.ipynb`](walkthrough.ipynb): it loads FLUX.1[schnell], builds the Local
    Replacement Model, traces and prunes a circuit for one feature, renders the interactive
    attribution graph, and runs a circuit-guided intervention end to end.
 
@@ -72,18 +73,35 @@ point `TRANSCODERS_DIR` at `{save-dir}/best` to use them.
 
 `--model` selects the architecture:
 
-| `--model` | Backbone |
-|---|---|
-| `flux-schnell` *(default)* | FLUX.1-schnell |
-| `flux-dev` | FLUX.1-dev |
-| `sd3-medium` | StableDiffusion 3 Medium |
-| `sd3.5-medium` | StableDiffusion 3.5 Medium |
+| `--model` | Backbone | Residual width | Dual-stream blocks |
+|---|---|---|---|
+| `flux-schnell` *(default)* | FLUX.1-schnell | 3072 | 19 |
+| `flux-dev` | FLUX.1-dev | 3072 | 19 |
+| `sd3-medium` | StableDiffusion 3 Medium | 1536 | 24 |
+| `sd3.5-medium` | StableDiffusion 3.5 Medium | 1536 | 24 |
 
 ```bash
 python train_transcoder.py --model sd3-medium --layers 6 12 18 --save-dir ./output_sd3
 ```
 
 Use `--model-id` to point at a local snapshot instead of the Hub (offline runners).
+
+Circuit tracing takes the same four backbones. Use `LRMConfig.for_model`:
+
+```python
+from transcoder_circuits.replacement_model import LRMConfig
+from transcoder_circuits.circuit_analysis import LRMPipeline
+
+cfg = LRMConfig.for_model(
+    "sd3-medium",
+    transcoder_dir="output_sd3/best",
+    target_layers=tuple(range(16)),
+    cfg_branch="cond",
+)
+pipeline = LRMPipeline(cfg)
+pipeline.initialize()
+pipeline.load_transcoders()
+```
 
 ### SAEs
 

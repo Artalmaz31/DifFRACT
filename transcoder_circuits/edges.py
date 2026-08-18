@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from .attribution_graph import NodeType, NodeId, EdgeData
-from .replacement_model import FluxTrace, LRMConfig, LRMPatcher
+from .replacement_model import Trace, LRMConfig, LRMPatcher
 
 
 class VJPComputer:
@@ -16,10 +16,11 @@ class VJPComputer:
         self.transformer = transformer
         self.transcoders = transcoders
         self.cfg = cfg
+        self.backend = cfg.get_backend()
 
     def compute_feature_vjp(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         target_layer: int,
         target_stream: str,
         target_position: int,
@@ -69,15 +70,15 @@ class VJPComputer:
             def target_ff_pre_hook(module, args):
                 x_ff_container["value"] = args[0]
 
-            first_blk = self.transformer.transformer_blocks[self.cfg.first_layer]
+            blocks = self.backend.blocks(self.transformer)
+            first_blk = blocks[self.cfg.first_layer]
             h = first_blk.register_forward_pre_hook(
                 boundary_inject_hook, with_kwargs=True
             )
             hooks.append(h)
 
             for layer_idx in self.cfg.target_layers:
-                blk = self.transformer.transformer_blocks[layer_idx]
-                h = blk.register_forward_pre_hook(
+                h = blocks[layer_idx].register_forward_pre_hook(
                     make_layer_input_hook(layer_idx), with_kwargs=True
                 )
                 hooks.append(h)
@@ -85,10 +86,12 @@ class VJPComputer:
             with LRMPatcher(
                 self.transformer, trace, self.transcoders, self.cfg, mode="linear"
             ):
-                target_blk = self.transformer.transformer_blocks[target_layer]
-                target_ff = (
-                    target_blk.ff if target_stream == "img" else target_blk.ff_context
-                )
+                target_ff = self.backend.ff(blocks[target_layer], target_stream)
+                if target_ff is None:
+                    raise ValueError(
+                        f"block {target_layer} has no '{target_stream}' MLP, so it "
+                        f"carries no transcoder features to trace."
+                    )
 
                 h = target_ff.register_forward_pre_hook(target_ff_pre_hook)
                 hooks.append(h)
@@ -142,10 +145,11 @@ class VJPComputer:
 
             return sensitivities
         finally:
-            tc_key = f"{target_stream}_{target_layer}"
-            self.transcoders[tc_key].cpu()
             for h in hooks:
                 h.remove()
+            tc = self.transcoders.get(f"{target_stream}_{target_layer}")
+            if tc is not None:
+                tc.cpu()
 
 
 class EdgeComputer:
@@ -153,13 +157,17 @@ class EdgeComputer:
         self,
         transcoders: Dict[str, nn.Module],
         cfg: "LRMConfig",
+        min_attribution: Optional[float] = None,
     ):
         self.transcoders = transcoders
         self.cfg = cfg
+        self.min_attribution = (
+            cfg.circuit_min_attribution if min_attribution is None else min_attribution
+        )
 
     def compute_feature_edges(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         target_node: NodeId,
         vjp_grads: Dict[Tuple[int, str], Optional[Tensor]],
     ) -> List[EdgeData]:
@@ -188,7 +196,7 @@ class EdgeComputer:
 
     def _compute_feature_edges_from_layer(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         src_layer: int,
         src_stream: str,
         target_node: NodeId,
@@ -230,7 +238,7 @@ class EdgeComputer:
         w_eff = torch.matmul(v_gated, W_dec)
         attributions = z_flat * w_eff
 
-        thresh = self.cfg.circuit_min_attribution
+        thresh = self.min_attribution
         z_active = z_flat.abs() > thresh
         attr_above = attributions.abs() >= thresh
         valid_mask = z_active & attr_above
@@ -270,7 +278,7 @@ class EdgeComputer:
 
     def _compute_error_edges_per_position(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         src_layer: int,
         src_stream: str,
         target_node: NodeId,
@@ -303,7 +311,7 @@ class EdgeComputer:
         gated_error = error[0] * gate[0]
         attrs_per_pos = (gated_error * v[0]).sum(dim=-1)
 
-        mask = attrs_per_pos.abs() >= self.cfg.circuit_min_attribution
+        mask = attrs_per_pos.abs() >= self.min_attribution
         valid_pos = torch.nonzero(mask, as_tuple=False).squeeze(-1)
         if valid_pos.numel() == 0:
             return edges
@@ -330,7 +338,7 @@ class EdgeComputer:
 
     def _compute_boundary_edges_per_position(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         target_node: NodeId,
         vjp_grads: Dict[Tuple[int, str], Optional[Tensor]],
     ) -> List[EdgeData]:
@@ -351,7 +359,7 @@ class EdgeComputer:
             v = v.to(device, dtype=torch.float32)
 
             attrs_per_pos = (boundary[0] * v[0]).sum(dim=-1)
-            mask = attrs_per_pos.abs() >= self.cfg.circuit_min_attribution
+            mask = attrs_per_pos.abs() >= self.min_attribution
             valid_pos = torch.nonzero(mask, as_tuple=False).squeeze(-1)
             if valid_pos.numel() == 0:
                 continue

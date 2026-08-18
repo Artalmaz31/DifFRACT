@@ -7,7 +7,13 @@ from torch import Tensor
 from .attribution_graph import NodeType, NodeId, EdgeData, AttributionGraph
 from .edges import VJPComputer, EdgeComputer
 from .influence import build_adjacency, normalized_adjacency, indirect_influence
-from .replacement_model import FluxTrace, LRMConfig
+from .replacement_model import (
+    Trace,
+    LRMConfig,
+    LayerCache,
+    FrozenAttentionWrapper,
+    FrozenSelfAttentionWrapper,
+)
 
 
 @dataclass
@@ -29,6 +35,7 @@ class CircuitTracer:
         self.transformer = transformer
         self.transcoders = transcoders
         self.cfg = cfg
+        self.backend = cfg.get_backend()
         self.expansion_cfg = expansion_cfg or ExpansionConfig(
             max_nodes=cfg.circuit_max_nodes,
             min_attribution=cfg.circuit_min_attribution,
@@ -36,11 +43,13 @@ class CircuitTracer:
         )
 
         self.vjp_computer = VJPComputer(transformer, transcoders, cfg)
-        self.edge_computer = EdgeComputer(transcoders, cfg)
+        self.edge_computer = EdgeComputer(
+            transcoders, cfg, min_attribution=self.expansion_cfg.min_attribution
+        )
 
     def trace_circuit(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         target_layer: int,
         target_stream: str,
         target_position: int,
@@ -166,42 +175,204 @@ class CircuitTracer:
         return graph
 
     @staticmethod
+    def _gated_error_contribution(
+        gate: Tensor,
+        err: Tensor,
+        vjp_grad: Tensor,
+    ) -> float:
+        if gate is None or err is None or vjp_grad is None:
+            return 0.0
+        device = vjp_grad.device
+        gate = gate.to(device=device, dtype=torch.float32)
+        err = err.to(device=device, dtype=torch.float32)
+        grad = vjp_grad.to(dtype=torch.float32)
+        if gate.dim() == 2:
+            gate = gate.unsqueeze(1)
+        return ((gate * err) * grad).sum().item()
+
+    def _target_mid_multiplier(
+        self,
+        trace: Trace,
+        target_node: NodeId,
+    ) -> Tensor:
+        lc = trace.get_layer(target_node.layer)
+        s = target_node.stream
+        nu = getattr(lc, f"{s}_norm2_inv_denom", None)
+        tc = self.transcoders.get(f"{s}_{target_node.layer}")
+
+        dev = tc.encoder.weight.device
+        t = trace.timestep_tensor.view(-1).to(device=dev, dtype=torch.float32)
+        with torch.no_grad():
+            scale_tc, _ = tc._scale_shift(t, device=dev, dtype=torch.float32)
+        scale_tc = scale_tc[0].float().cpu()
+
+        f_enc = tc.encoder.weight[target_node.feat_idx].detach().float().cpu()
+        scale_mlp = getattr(lc, f"{s}_scale_mlp", None)
+        scale_mlp = (
+            scale_mlp[0].float().cpu()
+            if scale_mlp is not None
+            else torch.zeros_like(f_enc)
+        )
+
+        u = f_enc * (1.0 + scale_tc) * (1.0 + scale_mlp)
+        v = u * nu[0, target_node.position].float().cpu()
+        return v - v.mean()
+
+    def _attention_ov_constants(self, lc: LayerCache) -> Optional[Dict[str, Tensor]]:
+        cache = lc.attention
+        if cache is None or lc.img_shift_msa is None:
+            return None
+
+        blk = self.backend.blocks(self.transformer)[lc.layer_idx]
+        param = next(blk.attn.parameters())
+        dev, dt = param.device, param.dtype
+
+        shift_img = lc.img_shift_msa[0].to(dev, dt)
+        shift_txt = (
+            lc.txt_shift_msa[0].to(dev, dt)
+            if lc.txt_shift_msa is not None
+            else torch.zeros_like(shift_img)
+        )
+        x_img = shift_img.view(1, 1, -1).expand(1, cache.S_img, -1).contiguous()
+        x_txt = shift_txt.view(1, 1, -1).expand(1, cache.S_txt, -1).contiguous()
+
+        with torch.no_grad():
+            out_img, out_txt = FrozenAttentionWrapper(blk.attn, cache, self.backend)(
+                x_img, x_txt
+            )
+        err_img, err_txt = cache.get_errors_on_device(dev, out_img.dtype)
+        kappa = {
+            "img": (out_img - err_img).float(),
+            "txt": (out_txt - err_txt).float(),
+        }
+
+        attn2 = self.backend.dual_attn(blk)
+        if (
+            attn2 is not None
+            and lc.attention2 is not None
+            and lc.img_shift_msa2 is not None
+        ):
+            x2 = (
+                lc.img_shift_msa2[0]
+                .to(dev, dt)
+                .view(1, 1, -1)
+                .expand(1, lc.attention2.S_img, -1)
+                .contiguous()
+            )
+            with torch.no_grad():
+                out2 = FrozenSelfAttentionWrapper(attn2, lc.attention2, self.backend)(
+                    x2
+                )
+            err2 = lc.attention2.get_error_on_device(dev, out2.dtype)
+            kappa["img2"] = (out2 - err2).float()
+
+        return kappa
+
     def _compute_attn_error_bias(
-        trace: FluxTrace,
+        self,
+        trace: Trace,
         target_node: NodeId,
         vjp_grads: Dict[Tuple[int, str], Optional[Tensor]],
+        mult_star: Tensor,
     ) -> float:
         """Compute the total contribution of frozen attention errors to h_pre."""
         total = 0.0
         for layer in sorted(trace.layer_caches.keys()):
-            if layer >= target_node.layer:
+            if layer > target_node.layer:
                 continue
             lc = trace.get_layer(layer)
-            ac = lc.attention
-            if ac is None:
+
+            if layer == target_node.layer:
+                if lc.attention is None:
+                    continue
+                s, p = target_node.stream, target_node.position
+                gate = getattr(lc, f"{s}_gate_msa", None)
+                err = getattr(lc.attention, f"attn_error_{s}", None)
+                if gate is not None and err is not None:
+                    total += float(
+                        (gate[0].float() * err[0, p].float() * mult_star).sum()
+                    )
+                if (
+                    s == "img"
+                    and lc.attention2 is not None
+                    and lc.img_gate_msa2 is not None
+                ):
+                    total += float((
+                            lc.img_gate_msa2[0].float()
+                            * lc.attention2.attn_error_img[0, p].float()
+                            * mult_star
+                        ).sum()
+                    )
                 continue
+
+            write_layer = min(layer + 1, target_node.layer)
+            if lc.attention is not None:
+                for stream in ("img", "txt"):
+                    total += self._gated_error_contribution(
+                        getattr(lc, f"{stream}_gate_msa", None),
+                        getattr(lc.attention, f"attn_error_{stream}", None),
+                        vjp_grads.get((write_layer, stream)),
+                    )
+
+            if lc.attention2 is not None:
+                total += self._gated_error_contribution(
+                    lc.img_gate_msa2,
+                    lc.attention2.attn_error_img,
+                    vjp_grads.get((write_layer, "img")),
+                )
+        return total
+
+    def _compute_ov_constant_bias(
+        self,
+        trace: Trace,
+        target_node: NodeId,
+        vjp_grads: Dict[Tuple[int, str], Optional[Tensor]],
+        mult_star: Tensor,
+    ) -> float:
+        """Constant part of every frozen OV pathway feeding the target."""
+        total = 0.0
+        for layer in sorted(trace.layer_caches.keys()):
+            if layer > target_node.layer:
+                continue
+            lc = trace.get_layer(layer)
+            kappa = self._attention_ov_constants(lc)
+            if kappa is None:
+                continue
+
+            if layer == target_node.layer:
+                s, p = target_node.stream, target_node.position
+                gate = getattr(lc, f"{s}_gate_msa", None)
+                if gate is not None:
+                    total += float(
+                        (gate[0].float() * kappa[s][0, p].cpu() * mult_star).sum()
+                    )
+                if s == "img" and "img2" in kappa and lc.img_gate_msa2 is not None:
+                    total += float((
+                            lc.img_gate_msa2[0].float()
+                            * kappa["img2"][0, p].cpu()
+                            * mult_star
+                        ).sum()
+                    )
+                continue
+
+            write_layer = min(layer + 1, target_node.layer)
             for stream in ("img", "txt"):
-                gate_msa = getattr(lc, f"{stream}_gate_msa", None)
-                attn_err = getattr(ac, f"attn_error_{stream}", None)
-                if gate_msa is None or attn_err is None:
-                    continue
-                write_layer = min(layer + 1, target_node.layer)
-                vjp_grad = vjp_grads.get((write_layer, stream))
-                if vjp_grad is None:
-                    continue
-                device = vjp_grad.device
-                gate = gate_msa.to(device=device, dtype=torch.float32)
-                err = attn_err.to(device=device, dtype=torch.float32)
-                grad = vjp_grad.to(dtype=torch.float32)
-                if gate.dim() == 2:
-                    gate = gate.unsqueeze(1)
-                gated_err = gate * err
-                total += (gated_err * grad).sum().item()
+                total += self._gated_error_contribution(
+                    getattr(lc, f"{stream}_gate_msa", None),
+                    kappa[stream],
+                    vjp_grads.get((write_layer, stream)),
+                )
+            if "img2" in kappa:
+                total += self._gated_error_contribution(
+                    lc.img_gate_msa2,
+                    kappa["img2"],
+                    vjp_grads.get((write_layer, "img")),
+                )
         return total
 
     @staticmethod
     def _compute_decoder_bias_contribution(
-        trace: FluxTrace,
+        trace: Trace,
         target_node: NodeId,
         vjp_grads: Dict[Tuple[int, str], Optional[Tensor]],
         transcoders: Dict[str, nn.Module],
@@ -239,7 +410,7 @@ class CircuitTracer:
 
     def _expand_node(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         graph: AttributionGraph,
         target_node: NodeId,
         expanded: Set[NodeId],
@@ -256,10 +427,12 @@ class CircuitTracer:
         )
 
         if target_node == graph.target_id:
+            mult_star = self._target_mid_multiplier(trace, target_node)
             attn_err_bias = self._compute_attn_error_bias(
                 trace,
                 target_node,
                 vjp_grads,
+                mult_star,
             )
             dec_bias_contrib = self._compute_decoder_bias_contribution(
                 trace,
@@ -267,7 +440,8 @@ class CircuitTracer:
                 vjp_grads,
                 self.transcoders,
             )
-            graph.target_encoder_bias += attn_err_bias + dec_bias_contrib
+            ov_const_bias = self._compute_ov_constant_bias(trace, target_node, vjp_grads, mult_star)
+            graph.target_encoder_bias += attn_err_bias + dec_bias_contrib + ov_const_bias
 
         all_edges = self.edge_computer.compute_feature_edges(
             trace,

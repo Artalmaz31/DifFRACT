@@ -15,13 +15,15 @@ from PIL import Image
 from tqdm.auto import tqdm
 import transformers
 from datasets import load_dataset
-from diffusers import FluxPipeline
+import diffusers
 from transcoder_training.transcoder import load_transcoders
-from .pipeline import FluxLRMPipeline
-from .replacement_model import FluxTrace
+from .backends import get_backend, get_spec
+from .pipeline import LRMPipeline
+from .replacement_model import Trace
 from IPython.display import display, HTML
 
 CONFIG = {
+    "backend": "flux-schnell",
     "model_id": "black-forest-labs/FLUX.1-schnell",
     "dataset_id": "yvdao/midjourney-v6",
     "dataset_column": "prompt",
@@ -38,6 +40,9 @@ CONFIG = {
     "batch_size": 64,
     "seed_base": 42,
     "num_inference_steps": 4,
+    "guidance_scale": 0.0,
+    "timestep_scale": 1.0,
+    "cfg_branch": "cond",
     "top_k_per_feature": 5,
     "winner_top_m": 128,
     "batch_features": 2048,
@@ -49,6 +54,21 @@ CONFIG = {
     "ignore_special_tokens": False,
     "special_tokens": {"</s>"},
 }
+
+
+def config_for_backend(name: str, **overrides) -> dict:
+    spec = get_spec(name)
+    cfg = dict(CONFIG)
+    cfg.update(
+        backend=spec.name,
+        model_id=spec.default_model_id,
+        dims={"img": spec.d_model, "txt": spec.d_model},
+        num_inference_steps=spec.num_inference_steps,
+        guidance_scale=spec.guidance_scale,
+        timestep_scale=spec.timestep_scale,
+    )
+    cfg.update(overrides)
+    return cfg
 
 
 @dataclass
@@ -146,8 +166,12 @@ class ActivationCapturer:
         n_inference_steps,
         capture_steps,
         max_only,
+        backend,
         batch_features=2048,
         subset_feature_idx=None,
+        timestep_scale: float = 1.0,
+        cfg_branch: str = "cond",
+        guidance_scale: Optional[float] = None,
     ):
         self.pipe = pipe
         self.layers = layers
@@ -158,9 +182,17 @@ class ActivationCapturer:
         self.max_only = max_only
         self.batch_features = batch_features
         self.subset_feature_idx = subset_feature_idx or {}
+        self.backend = backend
+        self.timestep_scale = float(timestep_scale)
+        self.cfg_branch = cfg_branch
+        self.guidance_scale = (
+            backend.spec.guidance_scale if guidance_scale is None else guidance_scale
+        )
+        self._real_cfg = backend.runs_real_cfg(self.guidance_scale)
 
         self.step_call_idx = -1
         self.current_timestep = None
+        self.batch_total = None
         self.captured = {}
         self.hooks = []
 
@@ -170,18 +202,33 @@ class ActivationCapturer:
             )
         )
 
+        blocks = self.backend.blocks(pipe.transformer)
         for l in layers:
-            blk = pipe.transformer.transformer_blocks[l]
-            self.hooks.append(blk.ff.register_forward_hook(self._make_hook(f"img_{l}")))
-            self.hooks.append(
-                blk.ff_context.register_forward_hook(self._make_hook(f"txt_{l}"))
-            )
+            for stream in ("img", "txt"):
+                ff = self.backend.ff(blocks[l], stream)
+                if ff is not None:
+                    self.hooks.append(
+                        ff.register_forward_hook(self._make_hook(f"{stream}_{l}"))
+                    )
 
     def _on_transformer_pre(self, module, args, kwargs):
         self.step_call_idx += 1
         t = kwargs.get("timestep", None)
-        self.current_timestep = t
+        self.current_timestep = None if t is None else t / self.timestep_scale
+        hs = kwargs.get("hidden_states", args[0] if args else None)
+        self.batch_total = None if hs is None else hs.shape[0]
         return None
+
+    def _select(self, x):
+        if not self._real_cfg:
+            return x
+        total = self.batch_total
+        if total is None or not torch.is_tensor(x) or x.shape[0] != total:
+            return x
+        if total < 2 or total % 2 != 0:
+            return x
+        half = total // 2
+        return x[:half] if self.cfg_branch == "uncond" else x[half:]
 
     def _make_hook(self, key):
         def hook_fn(module, args, output):
@@ -189,9 +236,9 @@ class ActivationCapturer:
             if step not in self.capture_set:
                 return
 
-            x = args[0]
+            x = self._select(args[0])
             tc = self.transcoders[key]
-            t = self.current_timestep
+            t = self._select(self.current_timestep)
 
             with torch.no_grad():
                 if key in self.subset_feature_idx:
@@ -245,67 +292,75 @@ def pass_a_scan(pipe, transcoders, prompts, cfg):
 
     any_key = f"img_{cfg['target_layers'][0]}"
     n_features = transcoders[any_key].d_feat
+    backend = get_backend(cfg["backend"])
 
     capturer = ActivationCapturer(
         pipe=pipe,
-        layers=CONFIG["target_layers"],
+        layers=cfg["target_layers"],
         transcoders=transcoders,
         n_inference_steps=n_steps,
         capture_steps=capture_steps,
         max_only=True,
-        batch_features=CONFIG["batch_features"],
+        batch_features=cfg["batch_features"],
         subset_feature_idx=None,
+        backend=backend,
+        timestep_scale=cfg.get("timestep_scale", 1.0),
+        cfg_branch=cfg.get("cfg_branch", "cond"),
+        guidance_scale=cfg.get("guidance_scale"),
     )
 
     tables = {}
-    for l in cfg["target_layers"]:
-        for stream in ["img", "txt"]:
-            key = f"{stream}_{l}"
-            tables[key] = {
-                st: TopKTable(n_features, cfg["top_k_per_feature"], device)
-                for st in capture_steps
-            }
+    for key in transcoders:
+        tables[key] = {
+            st: TopKTable(n_features, cfg["top_k_per_feature"], device)
+            for st in capture_steps
+        }
 
-    n_batches = (len(prompts) + bs - 1) // bs
-    for b in tqdm(range(n_batches), desc="Pass A"):
-        s = b * bs
-        e = min(s + bs, len(prompts))
-        batch_prompts = prompts[s:e]
-        B = len(batch_prompts)
+    try:
+        n_batches = (len(prompts) + bs - 1) // bs
+        for b in tqdm(range(n_batches), desc="Pass A"):
+            s = b * bs
+            e = min(s + bs, len(prompts))
+            batch_prompts = prompts[s:e]
+            B = len(batch_prompts)
 
-        seeds = torch.tensor(
-            [seed_base + s + i for i in range(B)], device=device, dtype=torch.int32
-        )
-        prompt_idx = torch.tensor(list(range(s, e)), device=device, dtype=torch.int32)
-        generators = [
-            torch.Generator(device=device).manual_seed(int(x)) for x in seeds.tolist()
-        ]
+            seeds = torch.tensor(
+                [seed_base + s + i for i in range(B)], device=device, dtype=torch.int32
+            )
+            prompt_idx = torch.tensor(
+                list(range(s, e)), device=device, dtype=torch.int32
+            )
+            generators = [
+                torch.Generator(device=device).manual_seed(int(x))
+                for x in seeds.tolist()
+            ]
 
-        capturer.reset()
-        _ = pipe(
-            batch_prompts,
-            prompt_2=batch_prompts,
-            height=H,
-            width=W,
-            num_inference_steps=n_steps,
-            guidance_scale=0.0,
-            output_type="latent",
-            generator=generators,
-        )
+            capturer.reset()
+            _ = pipe(
+                batch_prompts,
+                height=H,
+                width=W,
+                num_inference_steps=n_steps,
+                output_type="latent",
+                generator=generators,
+                **backend.generation_kwargs(
+                    batch_prompts, cfg.get("guidance_scale", 0.0)
+                ),
+            )
 
-        for key, by_step in capturer.captured.items():
-            for st, max_feats in by_step.items():
-                tab = tables[key][st]
-                tab.update_topk(
-                    max_feats, prompt_idx=prompt_idx, seed=seeds, step_idx=st
-                )
-                tab.update_winners(max_feats, top_m=CONFIG["winner_top_m"])
+            for key, by_step in capturer.captured.items():
+                for st, max_feats in by_step.items():
+                    tab = tables[key][st]
+                    tab.update_topk(
+                        max_feats, prompt_idx=prompt_idx, seed=seeds, step_idx=st
+                    )
+                    tab.update_winners(max_feats, top_m=cfg["winner_top_m"])
 
-        if b % 20 == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    capturer.close()
+            if b % 20 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        capturer.close()
 
     out = {
         key: {st: tab.to_cpu() for st, tab in sd.items()} for key, sd in tables.items()
@@ -451,8 +506,12 @@ def pass_b_extract(pipe, transcoders, prompts, scan, selected_features, best_ste
         n_inference_steps=n_steps,
         capture_steps=capture_steps,
         max_only=False,
+        backend=get_backend(cfg["backend"]),
         batch_features=cfg["batch_features"],
         subset_feature_idx=subset_idx,
+        timestep_scale=cfg.get("timestep_scale", 1.0),
+        cfg_branch=cfg.get("cfg_branch", "cond"),
+        guidance_scale=cfg.get("guidance_scale"),
     )
 
     all_ex = set()
@@ -469,48 +528,52 @@ def pass_b_extract(pipe, transcoders, prompts, scan, selected_features, best_ste
     for key in selected_features.keys():
         acts[key] = {st: [] for st in capture_steps}
 
+    backend = get_backend(cfg["backend"])
     images = [] if cfg.get("save_images", True) else None
     examples = []
-    n_batches = (len(all_ex) + bs - 1) // bs
-    for b in tqdm(range(n_batches), desc="Pass B"):
-        s = b * bs
-        e = min(s + bs, len(all_ex))
-        batch_ex = all_ex[s:e]
+    try:
+        n_batches = (len(all_ex) + bs - 1) // bs
+        for b in tqdm(range(n_batches), desc="Pass B"):
+            s = b * bs
+            e = min(s + bs, len(all_ex))
+            batch_ex = all_ex[s:e]
 
-        batch_prompts = [prompts[x.prompt_idx] for x in batch_ex]
-        generators = [
-            torch.Generator(device=device).manual_seed(int(x.seed)) for x in batch_ex
-        ]
+            batch_prompts = [prompts[x.prompt_idx] for x in batch_ex]
+            generators = [
+                torch.Generator(device=device).manual_seed(int(x.seed))
+                for x in batch_ex
+            ]
 
-        capturer.reset()
-        out = pipe(
-            batch_prompts,
-            prompt_2=batch_prompts,
-            height=H,
-            width=W,
-            num_inference_steps=n_steps,
-            guidance_scale=0.0,
-            output_type="pil" if cfg.get("save_images", True) else "latent",
-            generator=generators,
-        )
+            capturer.reset()
+            out = pipe(
+                batch_prompts,
+                height=H,
+                width=W,
+                num_inference_steps=n_steps,
+                output_type="pil" if cfg.get("save_images", True) else "latent",
+                generator=generators,
+                **backend.generation_kwargs(
+                    batch_prompts, cfg.get("guidance_scale", 0.0)
+                ),
+            )
 
-        for ex in batch_ex:
-            examples.append({"prompt_idx": ex.prompt_idx, "seed": ex.seed})
+            for ex in batch_ex:
+                examples.append({"prompt_idx": ex.prompt_idx, "seed": ex.seed})
 
-        if images is not None:
-            images.extend(list(out.images))
+            if images is not None:
+                images.extend(list(out.images))
 
-        for key, by_step in capturer.captured.items():
-            for st, tens in by_step.items():
-                arr = tens.detach().to(torch.float16).cpu().numpy()
-                for i in range(arr.shape[0]):
-                    acts[key][st].append(arr[i])
+            for key, by_step in capturer.captured.items():
+                for st, tens in by_step.items():
+                    arr = tens.detach().to(torch.float16).cpu().numpy()
+                    for i in range(arr.shape[0]):
+                        acts[key][st].append(arr[i])
 
-        if b % 20 == 0:
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    capturer.close()
+            if b % 20 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+    finally:
+        capturer.close()
 
     example_index = {}
     for i, ex in enumerate(examples):
@@ -541,36 +604,43 @@ def run_pipeline(cfg):
     transformers.utils.logging.set_verbosity_error()
     logging.getLogger("diffusers").setLevel(logging.ERROR)
 
-    pipe = FluxPipeline.from_pretrained(cfg["model_id"], torch_dtype=cfg["dtype"]).to(
+    backend = get_backend(cfg["backend"])
+    spec = get_spec(cfg["backend"])
+    PipelineCls = getattr(diffusers, spec.pipeline_cls)
+    pipe = PipelineCls.from_pretrained(cfg["model_id"], torch_dtype=cfg["dtype"]).to(
         cfg["device"]
     )
     pipe.transformer.requires_grad_(False)
     pipe.set_progress_bar_config(disable=True)
 
-    transcoders = load_transcoders(
-        cfg["transcoder_dir"],
-        cfg["target_layers"],
-        d_model=cfg["dims"]["img"],
-        expansion_factor=cfg["expansion_factor"],
-        time_embed_dim=cfg["time_embed_dim"],
-        device=cfg["device"],
-        dtype=cfg["dtype"],
-    )
+    blocks = backend.blocks(pipe.transformer)
+    transcoders = {}
+    for layer in cfg["target_layers"]:
+        transcoders.update(
+            load_transcoders(
+                cfg["transcoder_dir"],
+                [layer],
+                d_model=cfg["dims"]["img"],
+                expansion_factor=cfg["expansion_factor"],
+                time_embed_dim=cfg["time_embed_dim"],
+                streams=backend.streams(blocks[layer]),
+                device=cfg["device"],
+                dtype=cfg["dtype"],
+            )
+        )
 
     prompts = load_prompts_stream(cfg)
     scan = pass_a_scan(pipe, transcoders, prompts, cfg)
 
     selected_features = {}
     best_step = {}
-    for l in cfg["target_layers"]:
-        for stream in ["img", "txt"]:
-            key = f"{stream}_{l}"
-            feats, bs = select_features(
-                scan, key, max_features_per_key=cfg["max_features_per_key"]
-            )
-            selected_features[key] = feats
-            best_step[key] = bs
-            print(f"{key}: {len(feats)} features selected")
+    for key in scan:
+        feats, bs = select_features(
+            scan, key, max_features_per_key=cfg["max_features_per_key"]
+        )
+        selected_features[key] = feats
+        best_step[key] = bs
+        print(f"{key}: {len(feats)} features selected")
 
     pass_b_state = pass_b_extract(
         pipe, transcoders, prompts, scan, selected_features, best_step, cfg
@@ -578,10 +648,8 @@ def run_pipeline(cfg):
     return pipe, prompts, scan, selected_features, pass_b_state
 
 
-def tokenize_for_display(pipe, prompt):
-    enc = pipe.tokenizer_2(prompt, truncation=True, max_length=512, return_tensors="pt")
-    ids = enc.input_ids[0].tolist()
-    toks = pipe.tokenizer_2.convert_ids_to_tokens(ids)
+def tokenize_for_display(pipe, prompt, cfg=CONFIG):
+    toks = get_backend(cfg["backend"]).tokenize_for_display(pipe, prompt)
 
     out = []
     for t in toks:
@@ -645,14 +713,10 @@ def token_highlight_html(tokens, acts_1d, cfg=CONFIG):
     )
 
 
-def flux_grid_hw(height, width):
-    return height // 16, width // 16
-
-
 def make_flux_overlay_patches(image, token_acts_1d, height, width, cfg=CONFIG):
     acts = token_acts_1d.astype(np.float32)
 
-    gh, gw = flux_grid_hw(height, width)
+    gh, gw = get_backend(cfg["backend"]).image_grid(height, width)
     need = gh * gw
 
     drop = acts.shape[0] - need
@@ -790,7 +854,7 @@ def show_text_feature(
         acts_1d = arr[:, col]
 
         prompt = prompts[r.prompt_idx]
-        tokens = tokenize_for_display(pipe, prompt)
+        tokens = tokenize_for_display(pipe, prompt, cfg=cfg)
         html_tokens = token_highlight_html(tokens, acts_1d, cfg=cfg)
 
         display(
@@ -915,7 +979,7 @@ def build_feature_tooltips(
                     f"style='border-radius:4px;margin-bottom:4px;'>"
                 )
             else:
-                tokens = tokenize_for_display(pipe, prompts[r.prompt_idx])
+                tokens = tokenize_for_display(pipe, prompts[r.prompt_idx], cfg=cfg)
                 blocks.append(token_highlight_html(tokens, acts_1d, cfg=cfg))
         blocks.append("</div>")
         tips[nid] = "".join(blocks)
@@ -972,10 +1036,10 @@ class ScanResult:
 class FeatureScanner:
     """Automated feature discovery for circuit tracing experiments."""
 
-    def __init__(self, pipeline: FluxLRMPipeline, device: str = "cuda"):
+    def __init__(self, pipeline: LRMPipeline, device: str = "cuda"):
         self.pipeline = pipeline
         self.device = device
-        self._trace_cache: Dict[Tuple, FluxTrace] = {}
+        self._trace_cache: Dict[Tuple, Trace] = {}
         self._image_cache: Dict[Tuple[str, int], Image.Image] = {}
 
     def scan_and_trace(
@@ -1336,13 +1400,12 @@ class FeatureScanner:
             gen = torch.Generator(cfg.device).manual_seed(seed)
             result = self.pipeline.pipe(
                 prompt,
-                prompt_2=prompt,
                 height=cfg.height,
                 width=cfg.width,
                 num_inference_steps=cfg.num_inference_steps,
-                guidance_scale=cfg.guidance_scale,
                 generator=gen,
                 output_type="pil",
+                **cfg.generation_kwargs(prompt),
             )
             self._image_cache[key] = result.images[0]
         return self._image_cache[key]

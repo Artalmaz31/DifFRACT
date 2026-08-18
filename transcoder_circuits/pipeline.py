@@ -5,12 +5,11 @@ from collections import defaultdict
 import pandas as pd
 from time import time
 import torch
-from diffusers import FluxPipeline
 from transcoder_training.transcoder import TemporalAwareTranscoder, load_transcoders
 from .attribution_graph import AttributionGraph, AggAttributionGraph, GraphAggregator
 from .tracing import ExpansionConfig, CircuitTracer
 from .pruning import GraphPruner
-from .replacement_model import FluxTrace, LRMConfig, FluxTraceCapturer
+from .replacement_model import Trace, LRMConfig, TraceCapturer, load_pipeline
 
 
 def infer_position_for_feature(
@@ -28,13 +27,13 @@ def infer_position_for_feature(
     return pos, score
 
 
-class FluxLRMPipeline:
+class LRMPipeline:
     def __init__(self, cfg: LRMConfig):
         self.cfg = cfg
-
-        self.pipe: Optional["FluxPipeline"] = None
+        self.backend = cfg.get_backend()
+        self.pipe = None
         self.transcoders: Dict[str, TemporalAwareTranscoder] = {}
-        self.capturer: Optional[FluxTraceCapturer] = None
+        self.capturer: Optional[TraceCapturer] = None
         self.circuit_tracer: Optional[CircuitTracer] = None
         self.perturbation_validator: Optional[Any] = None
         self.pruner: Optional[GraphPruner] = None
@@ -44,27 +43,31 @@ class FluxLRMPipeline:
         # Tracing runs in float32 with TF32 disabled for attribution accuracy.
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        self.pipe = load_pipeline(self.cfg)
 
-        self.pipe = FluxPipeline.from_pretrained(
-            self.cfg.model_id,
-            torch_dtype=self.cfg.dtype,
-        ).to(self.cfg.device)
+    def traceable_streams(self, layer: int) -> Tuple[str, ...]:
+        return self.backend.streams(self.backend.blocks(self.pipe.transformer)[layer])
 
     def load_transcoders(self):
-        self.transcoders = load_transcoders(
-            self.cfg.transcoder_dir,
-            self.cfg.target_layers,
-            d_model=self.cfg.d_model,
-            expansion_factor=self.cfg.expansion_factor,
-            time_embed_dim=self.cfg.time_embed_dim,
-            device="cpu",
-            dtype=torch.float32,
-            requires_grad=False,
-        )
+        self.transcoders = {}
+        for layer in self.cfg.target_layers:
+            self.transcoders.update(
+                load_transcoders(
+                    self.cfg.transcoder_dir,
+                    [layer],
+                    d_model=self.cfg.d_model,
+                    expansion_factor=self.cfg.expansion_factor,
+                    time_embed_dim=self.cfg.time_embed_dim,
+                    streams=self.traceable_streams(layer),
+                    device="cpu",
+                    dtype=torch.float32,
+                    requires_grad=False,
+                )
+            )
 
         from .validation import LRMValidator, PerturbationValidator
 
-        self.capturer = FluxTraceCapturer(self.pipe, self.transcoders, self.cfg)
+        self.capturer = TraceCapturer(self.pipe, self.transcoders, self.cfg)
         self.circuit_tracer = CircuitTracer(
             self.pipe.transformer, self.transcoders, self.cfg
         )
@@ -84,15 +87,19 @@ class FluxLRMPipeline:
         prompt: str,
         seed: int = 42,
         step: int = 0,
-    ) -> FluxTrace:
+    ) -> Trace:
         return self.capturer.capture(prompt, seed, step)
 
-    def _build_config_metadata(self, trace: FluxTrace) -> Dict[str, Any]:
+    def _build_config_metadata(self, trace: Trace) -> Dict[str, Any]:
         return {
             "prompt": trace.prompt,
             "seed": trace.seed,
             "step": trace.step_idx,
             "timestep": trace.timestep,
+            "timestep_raw": trace.timestep_raw,
+            "backend": self.cfg.backend,
+            "guidance_scale": self.cfg.guidance_scale,
+            "cfg_branch": trace.cfg_branch,
             "model_id": self.cfg.model_id,
             "target_layers": list(self.cfg.target_layers),
             "height": self.cfg.height,
@@ -109,7 +116,7 @@ class FluxLRMPipeline:
 
     def trace_circuit(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         layer: int,
         stream: str,
         position: int,
@@ -173,7 +180,7 @@ class FluxLRMPipeline:
 
     def validate_perturbation(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         graph: AggAttributionGraph,
         top_k: int = 30,
         plot: bool = True,

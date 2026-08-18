@@ -1,6 +1,5 @@
-"""Circuit tracing for FLUX.1[schnell] via timestep-conditioned transcoders."""
-
 from . import (
+    backends,
     replacement_model,
     circuit_analysis,
     validation,
@@ -10,6 +9,7 @@ from . import (
 )
 
 __all__ = [
+    "backends",
     "replacement_model",
     "circuit_analysis",
     "validation",

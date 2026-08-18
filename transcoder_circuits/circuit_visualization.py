@@ -1,10 +1,7 @@
-"""Render saved attribution-graph JSONs as interactive pyvis HTML."""
-
 import json
 import math
 from collections import defaultdict
 from typing import Optional
-
 from pyvis.network import Network
 
 # Node palette and edge colors

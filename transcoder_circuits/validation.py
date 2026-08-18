@@ -4,11 +4,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from diffusers import FluxPipeline
 import matplotlib.pyplot as plt
 from scipy import stats as scipy_stats
 from .attribution_graph import NodeType, AggNodeId, AggAttributionGraph
-from .replacement_model import FluxTrace, LRMConfig, LRMPatcher
+from .backends import Backend, get_backend
+from .replacement_model import Trace, LRMConfig, LRMPatcher
 from .influence import (
     build_node_index,
     build_adjacency,
@@ -18,33 +18,17 @@ from .influence import (
 
 
 def decode_latents(
-    pipe: FluxPipeline, latents: torch.Tensor, height: int = 512, width: int = 512
+    pipe,
+    latents: torch.Tensor,
+    backend: Backend,
+    height: int = 512,
+    width: int = 512,
 ) -> np.ndarray:
-    with torch.no_grad():
-        lat = latents.to(device=pipe.vae.device, dtype=pipe.vae.dtype)
-
-        batch_size = lat.shape[0]
-        h_latent = height // 8
-        w_latent = width // 8
-        channels = lat.shape[-1]
-
-        lat = lat.view(batch_size, h_latent // 2, w_latent // 2, channels // 4, 2, 2)
-        lat = lat.permute(0, 3, 1, 4, 2, 5)
-        lat = lat.reshape(batch_size, channels // 4, h_latent, w_latent)
-
-        lat = lat / pipe.vae.config.scaling_factor
-
-        image = pipe.vae.decode(lat, return_dict=False)[0]
-
-        image = (image.float().cpu() / 2 + 0.5).clamp(0, 1)
-        image = image.permute(0, 2, 3, 1).numpy()
-        image = (image * 255).round().astype(np.uint8)
-
-        return image[0]
+    return backend.decode_latents(pipe, latents, height, width)
 
 
 class StepAwareLRMToggle:
-    def __init__(self, pipe: FluxPipeline, patcher: "LRMPatcher", target_step: int):
+    def __init__(self, pipe, patcher: "LRMPatcher", target_step: int):
         self.pipe = pipe
         self.transformer = pipe.transformer
         self.patcher = patcher
@@ -83,17 +67,22 @@ class StepAwareLRMToggle:
         if self._h_post is not None:
             self._h_post.remove()
             self._h_post = None
+        if self._active:
+            self.patcher.__exit__(None, None, None)
+            self._active = False
 
 
 @torch.no_grad()
 def generate_comparison_images(
-    pipe: FluxPipeline,
+    pipe,
     patcher: "LRMPatcher",
     cfg: LRMConfig,
     prompt: str,
     seed: int,
     target_step: int,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+    backend = cfg.get_backend()
+
     def run_pipeline(use_lrm: bool) -> torch.Tensor:
         gen = torch.Generator(device=cfg.device).manual_seed(seed)
         toggle = None
@@ -101,16 +90,19 @@ def generate_comparison_images(
             toggle = StepAwareLRMToggle(pipe, patcher, target_step)
             toggle.install()
 
-        result = pipe(
-            prompt,
-            prompt_2=prompt,
-            height=cfg.height,
-            width=cfg.width,
-            num_inference_steps=cfg.num_inference_steps,
-            guidance_scale=cfg.guidance_scale,
-            output_type="latent",
-            generator=gen,
-        )
+        try:
+            result = pipe(
+                prompt,
+                height=cfg.height,
+                width=cfg.width,
+                num_inference_steps=cfg.num_inference_steps,
+                output_type="latent",
+                generator=gen,
+                **cfg.generation_kwargs(prompt),
+            )
+        finally:
+            if toggle is not None:
+                toggle.remove()
         return result.images.detach().float().cpu()
 
     print("  Generating original image...")
@@ -129,8 +121,12 @@ def generate_comparison_images(
     }
 
     print("  Decoding images...")
-    img_orig = decode_latents(pipe, lat_orig.to(cfg.device), cfg.height, cfg.width)
-    img_lrm = decode_latents(pipe, lat_lrm.to(cfg.device), cfg.height, cfg.width)
+    img_orig = decode_latents(
+        pipe, lat_orig.to(cfg.device), backend, height=cfg.height, width=cfg.width
+    )
+    img_lrm = decode_latents(
+        pipe, lat_lrm.to(cfg.device), backend, height=cfg.height, width=cfg.width
+    )
 
     return img_orig, img_lrm, stats
 
@@ -168,6 +164,9 @@ def plot_comparison(
     mse = float((diff**2).mean())
     psnr = float(10 * np.log10(255**2 / max(mse, 1e-10)))
 
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
     plt.show()
     plt.close(fig)
 
@@ -179,13 +178,23 @@ def plot_comparison(
     }
 
 
+def _split_block_output(output) -> Dict[str, Optional[Tensor]]:
+    if not isinstance(output, tuple):
+        return {"img": output.detach().clone(), "txt": None}
+    txt, img = output[0], output[1]
+    return {
+        "img": img.detach().clone() if img is not None else None,
+        "txt": txt.detach().clone() if txt is not None else None,
+    }
+
+
 class LRMValidator:
     def __init__(self, cfg: LRMConfig):
         self.cfg = cfg
 
     def validate_attention_accuracy(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         *,
         layers: Optional[List[int]] = None,
         verbose: bool = True,
@@ -230,7 +239,7 @@ class LRMValidator:
     def validate_lrm_exact(
         self,
         transformer: nn.Module,
-        trace: FluxTrace,
+        trace: Trace,
         transcoders: Dict[str, nn.Module],
         verbose: bool = True,
     ) -> Dict[str, Any]:
@@ -240,68 +249,47 @@ class LRMValidator:
 
         def capture_original_hook(layer_idx):
             def hook(module, args, kwargs, output):
-                original_outputs[layer_idx] = {
-                    "img": (
-                        output[0].detach().clone()
-                        if isinstance(output, tuple)
-                        else output.detach().clone()
-                    ),
-                    "txt": (
-                        output[1].detach().clone()
-                        if isinstance(output, tuple) and len(output) > 1
-                        else None
-                    ),
-                }
+                original_outputs[layer_idx] = _split_block_output(output)
 
             return hook
 
+        blocks = self.cfg.get_backend().blocks(transformer)
         hooks = []
         for layer_idx in self.cfg.target_layers:
-            blk = transformer.transformer_blocks[layer_idx]
-            h = blk.register_forward_hook(
+            h = blocks[layer_idx].register_forward_hook(
                 capture_original_hook(layer_idx), with_kwargs=True
             )
             hooks.append(h)
 
-        with torch.no_grad():
-            original_out = transformer(**kwargs)
-
-        for h in hooks:
-            h.remove()
+        try:
+            with torch.no_grad():
+                original_out = transformer(**kwargs)
+        finally:
+            for h in hooks:
+                h.remove()
 
         lrm_outputs = {}
 
         def capture_lrm_hook(layer_idx):
             def hook(module, args, kwargs, output):
-                lrm_outputs[layer_idx] = {
-                    "img": (
-                        output[0].detach().clone()
-                        if isinstance(output, tuple)
-                        else output.detach().clone()
-                    ),
-                    "txt": (
-                        output[1].detach().clone()
-                        if isinstance(output, tuple) and len(output) > 1
-                        else None
-                    ),
-                }
+                lrm_outputs[layer_idx] = _split_block_output(output)
 
             return hook
 
         with LRMPatcher(transformer, trace, transcoders, self.cfg, mode="exact"):
             hooks = []
-            for layer_idx in self.cfg.target_layers:
-                blk = transformer.transformer_blocks[layer_idx]
-                h = blk.register_forward_hook(
-                    capture_lrm_hook(layer_idx), with_kwargs=True
-                )
-                hooks.append(h)
+            try:
+                for layer_idx in self.cfg.target_layers:
+                    h = blocks[layer_idx].register_forward_hook(
+                        capture_lrm_hook(layer_idx), with_kwargs=True
+                    )
+                    hooks.append(h)
 
-            with torch.no_grad():
-                lrm_out = transformer(**kwargs)
-
-            for h in hooks:
-                h.remove()
+                with torch.no_grad():
+                    lrm_out = transformer(**kwargs)
+            finally:
+                for h in hooks:
+                    h.remove()
 
         results = {
             "transformer_output": {
@@ -317,20 +305,12 @@ class LRMValidator:
                 lrm = lrm_outputs[layer_idx]
 
                 layer_result = {}
-                if orig["img"] is not None and lrm["img"] is not None:
-                    layer_result["img_max_err"] = (
-                        (lrm["img"] - orig["img"]).abs().max().item()
-                    )
-                    layer_result["img_mean_err"] = (
-                        (lrm["img"] - orig["img"]).abs().mean().item()
-                    )
-                if orig["txt"] is not None and lrm["txt"] is not None:
-                    layer_result["txt_max_err"] = (
-                        (lrm["txt"] - orig["txt"]).abs().max().item()
-                    )
-                    layer_result["txt_mean_err"] = (
-                        (lrm["txt"] - orig["txt"]).abs().mean().item()
-                    )
+                for stream in ("img", "txt"):
+                    if orig[stream] is None or lrm[stream] is None:
+                        continue
+                    err = (lrm[stream] - orig[stream]).abs()
+                    layer_result[f"{stream}_max_err"] = err.max().item()
+                    layer_result[f"{stream}_mean_err"] = err.mean().item()
 
                 results["per_layer"][layer_idx] = layer_result
 
@@ -342,11 +322,13 @@ class LRMValidator:
                 f"mean_err={results['transformer_output']['mean_err']:.3g}"
             )
             for layer_idx, r in results["per_layer"].items():
-                print(
-                    f"  L{layer_idx}: "
-                    f"img_max={r['img_max_err']:.3g} img_mean={r['img_mean_err']:.3g} | "
-                    f"txt_max={r['txt_max_err']:.3g} txt_mean={r['txt_mean_err']:.3g} | "
+                parts = " | ".join(
+                    f"{stream}_max={r[f'{stream}_max_err']:.3g} "
+                    f"{stream}_mean={r[f'{stream}_mean_err']:.3g}"
+                    for stream in ("img", "txt")
+                    if f"{stream}_max_err" in r
                 )
+                print(f"  L{layer_idx}: {parts}")
 
         return results
 
@@ -384,8 +366,8 @@ class LRMValidator:
 
     def validate_images_orig_vs_lrm(
         self,
-        pipe: FluxPipeline,
-        trace: FluxTrace,
+        pipe,
+        trace: Trace,
         transcoders: Dict[str, nn.Module],
         *,
         prompt: Optional[str] = None,
@@ -443,6 +425,14 @@ class PerturbationValidator:
         self.transformer = transformer
         self.transcoders = transcoders
         self.cfg = cfg
+        self.backend = cfg.get_backend()
+
+    def _ff(self, layer: int, stream: str) -> nn.Module:
+        blocks = self.backend.blocks(self.transformer)
+        ff = self.backend.ff(blocks[layer], stream)
+        if ff is None:
+            raise ValueError(f"block {layer} has no '{stream}' MLP.")
+        return ff
 
     @staticmethod
     def _get_best_position(
@@ -457,7 +447,7 @@ class PerturbationValidator:
 
     def validate(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         graph: "AggAttributionGraph",
         top_k: int = 30,
         verbose: bool = True,
@@ -569,7 +559,7 @@ class PerturbationValidator:
 
     def validate_direct(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         graph: "AggAttributionGraph",
         top_k: int = 30,
         verbose: bool = True,
@@ -699,7 +689,7 @@ class PerturbationValidator:
     @torch.no_grad()
     def _measure_target_h_pre(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         target_layer: int,
         target_stream: str,
         target_feat_idx: int,
@@ -718,10 +708,7 @@ class PerturbationValidator:
                 tcs_on_gpu.append(abl_tc)
                 self._install_ablation_hooks(trace, ablation, hooks)
 
-            target_blk = self.transformer.transformer_blocks[target_layer]
-            target_ff = (
-                target_blk.ff if target_stream == "img" else target_blk.ff_context
-            )
+            target_ff = self._ff(target_layer, target_stream)
 
             def target_ff_pre_hook(module, args):
                 x_ff_box["value"] = args[0]
@@ -755,7 +742,7 @@ class PerturbationValidator:
     @torch.no_grad()
     def _measure_all_features(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         feature_nodes: List["AggNodeId"],
         node_positions: Dict["AggNodeId", int],
         ablation: Optional[Tuple[int, str, int, int]] = None,
@@ -780,8 +767,7 @@ class PerturbationValidator:
                 self._install_ablation_hooks(trace, ablation, hooks)
 
             for layer, stream in layer_stream_feats.keys():
-                blk = self.transformer.transformer_blocks[layer]
-                ff = blk.ff if stream == "img" else blk.ff_context
+                ff = self._ff(layer, stream)
 
                 def make_hook(l, s):
                     def hook_fn(module, args):
@@ -824,13 +810,12 @@ class PerturbationValidator:
 
     def _install_ablation_hooks(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         ablation: Tuple[int, str, int, int],
         hooks: list,
     ) -> None:
         abl_layer, abl_stream, abl_pos, abl_feat = ablation
-        abl_blk = self.transformer.transformer_blocks[abl_layer]
-        abl_ff = abl_blk.ff if abl_stream == "img" else abl_blk.ff_context
+        abl_ff = self._ff(abl_layer, abl_stream)
         tc = self.transcoders[f"{abl_stream}_{abl_layer}"]
         device = self.cfg.device
 
@@ -869,7 +854,7 @@ class PerturbationValidator:
 
     def _compute_h_pre_from_x_ff(
         self,
-        trace: FluxTrace,
+        trace: Trace,
         x_ff: Tensor,
         target_layer: int,
         target_stream: str,

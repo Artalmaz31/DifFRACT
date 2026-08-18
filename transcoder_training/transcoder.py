@@ -55,6 +55,9 @@ class TemporalAwareTranscoder(nn.Module):
 
         mod = self.mod_linear(t_feat)
         scale, shift = mod.chunk(2, dim=-1)
+        while scale.dim() < x.dim():
+            scale = scale.unsqueeze(-2)
+            shift = shift.unsqueeze(-2)
         x_mod = x * (1.0 + scale) + shift
 
         z = F.relu(self.encoder(x_mod))

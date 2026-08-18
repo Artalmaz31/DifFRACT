@@ -2,7 +2,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set, Tuple
 import json
-from .replacement_model import FluxTrace
+from .replacement_model import Trace
 
 
 class NodeType(Enum):
@@ -311,7 +311,7 @@ class GraphAggregator:
     @staticmethod
     def aggregate(
         graph: "AttributionGraph",
-        trace: "FluxTrace",
+        trace: "Trace",
     ) -> AggAttributionGraph:
         target_agg = GraphAggregator._to_agg(graph.target_id)
 

@@ -130,8 +130,6 @@ Each notebook reproduces one steering experiment from the paper:
   attribution graph — how the image- and text-stream attribution shares shift across the four
   denoising steps, with interactive per-step graphs and a causal stepwise-suppression check.
 
-The two libraries used by these notebooks, [`transcoder_training/`](transcoder_training/) and
-[`transcoder_circuits/`](transcoder_circuits/), each carry a short README describing their modules.
 
 ## Citation
 

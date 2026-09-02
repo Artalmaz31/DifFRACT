@@ -30,7 +30,7 @@ FLUX_SCHNELL = ArchSpec(
     d_model=3072,
     guidance_scale=0.0,
     num_inference_steps=4,
-    buffer_size=1_000_000,
+    buffer_size=1_048_576,
     prompts_per_inference=32,
 )
 

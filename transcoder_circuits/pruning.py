@@ -49,7 +49,7 @@ class GraphPruner:
         self,
         graph: "AggAttributionGraph",
     ) -> "AggAttributionGraph":
-        """Remove feature nodes whose indirect influence on the target is small."""
+        """Remove nodes whose indirect influence on the target is small."""
         node_list, node_to_idx = build_node_index(graph)
         if len(node_list) == 0:
             return graph
@@ -163,8 +163,7 @@ class GraphPruner:
         for idx, nid in enumerate(node_list):
             if nid == target_id:
                 keep.add(nid)
-            elif nid.node_type.value in ("error", "residual", "input"):
-                # Error and input vertices are exempt from pruning
+            elif nid.node_type.value in ("error", "residual"):
                 keep.add(nid)
             elif nid.stream == "img":
                 prunable_img.append((idx, influence[idx]))
@@ -240,7 +239,7 @@ class GraphPruner:
         referenced.add(graph.target_id)
         for key, info in graph.nodes.items():
             nid = info["id"]
-            if nid.node_type.value in ("error", "residual", "input"):
+            if nid.node_type.value in ("error", "residual"):
                 referenced.add(nid)
 
         new_graph = AggAttributionGraph(

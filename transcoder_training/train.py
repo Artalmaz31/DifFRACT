@@ -59,7 +59,7 @@ class TrainConfig:
     width: int = 512
     prompt_aliases: Tuple[str, ...] = ("prompt_2",)
 
-    buffer_size: int = 1_000_000
+    buffer_size: int = 1_048_576
     batch_size: int = 4096
     total_cycles: int = 256
     prompts_per_inference: int = 32

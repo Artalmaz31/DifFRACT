@@ -163,6 +163,24 @@ def _check_trajectory_coverage(cfg):
         )
 
 
+def _move_optimizer_state(opt, device):
+    for state in opt.state.values():
+        for name, value in state.items():
+            if name != "step" and torch.is_tensor(value):
+                state[name] = value.to(device, non_blocking=True)
+
+
+def _park(model, opt):
+    opt.zero_grad(set_to_none=True)
+    model.to("cpu")
+    _move_optimizer_state(opt, "cpu")
+
+
+def _wake(model, opt, device):
+    model.to(device)
+    _move_optimizer_state(opt, device)
+
+
 def run_training(cfg: TrainConfig, role: str = "transcoder"):
     """Train all (layer, stream) dictionaries, role in {"transcoder", "sae"}."""
     assert role in ("transcoder", "sae")
@@ -247,15 +265,22 @@ def run_training(cfg: TrainConfig, role: str = "transcoder"):
         # one optimizer epoch per (layer, stream)
         models.train()
         stats = {k: {"nmse": 0.0, "l0": 0.0} for k in models.keys()}
+        for key in models:
+            _park(models[key], optimizers[key])
         for key in tqdm(list(models.keys()), desc="Backprop", leave=False):
             buf, model = buffers[key], models[key]
             s = key.split("_")[0]
             opt = optimizers[key]
+            _wake(model, opt, cfg.device)
+            x_all = buf["x"][:buf["ptr"]].to(cfg.device, non_blocking=True)
+            y_all = buf["y"][:buf["ptr"]].to(cfg.device, non_blocking=True)
+            t_all = buf["t"][:buf["ptr"]].to(cfg.device, non_blocking=True)
+
             for _ in tqdm(range(nsteps), desc=key, leave=False):
-                idx = torch.randint(0, buf["ptr"], (cfg.batch_size,), device="cpu")
-                bx = buf["x"][idx].to(cfg.device, non_blocking=True).float()
-                by = buf["y"][idx].to(cfg.device, non_blocking=True).float()
-                bt = buf["t"][idx].to(cfg.device, non_blocking=True)
+                idx = torch.randint(0, buf["ptr"], (cfg.batch_size,), device=cfg.device)
+                bx = x_all.index_select(0, idx).float()
+                by = y_all.index_select(0, idx).float()
+                bt = t_all.index_select(0, idx)
 
                 model_in = by if role == "sae" else bx
                 target = by
@@ -282,6 +307,10 @@ def run_training(cfg: TrainConfig, role: str = "transcoder"):
                 stats[key]["nmse"] += normalized_mse.item()
                 stats[key]["l0"] += (z > 0).float().sum(dim=-1).mean().item()
 
+            del x_all, y_all, t_all
+            _park(model, opt)
+        for key in models:
+            _wake(models[key], optimizers[key], cfg.device)
         for sched in schedulers.values():
             sched.step()
 

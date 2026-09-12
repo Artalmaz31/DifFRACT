@@ -44,13 +44,17 @@ given behaviour — and intervene on them.
    ```bash
    huggingface-cli login
    huggingface-cli download Artalmaz31/DifFRACT --repo-type model --local-dir weights
-   export TRANSCODERS_DIR=weights/temporal-aware-transcoders
+   export TRANSCODERS_DIR=weights/flux-schnell-transcoders
    ```
 
-   The release holds 40 checkpoints: the 34 timestep-conditioned transcoders
-   (`temporal-aware-transcoders/`, image and text streams for layers 0–15 and 18) used by the
-   walkthrough and case studies, plus the 6 SAE baselines (`temporal-aware-saes/`, layers 6/12/18)
-   for the sparsity–faithfulness comparison.
+   The release holds one folder per backbone: `flux-schnell-transcoders/` (image and text
+   streams for layers 0–15 and 18, used by the walkthrough and case studies),
+   `flux-dev-transcoders/` and `sd3-5-medium-transcoders/` (both streams, layers 0–15), plus the
+   6 SAE baselines in `flux-schnell-saes/` (layers 6/12/18) for the sparsity–faithfulness
+   comparison.
+   
+   Use `huggingface-cli download Artalmaz31/DifFRACT --include "flux-schnell-transcoders/*"`
+   to fetch a single folder.
 
 3. Work through [`walkthrough.ipynb`](walkthrough.ipynb): it loads FLUX.1[schnell], builds the Local
    Replacement Model, traces and prunes a circuit for one feature, renders the interactive
@@ -68,6 +72,13 @@ default `6 12 18`), `--save-dir` (checkpoint output dir), `--dataset-id` (HF pro
 `--cycles`, `--buffer-size`, `--batch-size`, `--device`. Checkpoints are written to
 `{save-dir}/best/transcoder_{stream}_{layer}.pt` (best by validation cosine) and `{save-dir}/last/`;
 point `TRANSCODERS_DIR` at `{save-dir}/best` to use them.
+
+To resume an interrupted run, use:
+
+```bash
+python train_transcoder.py --layers $(seq 0 15) --save-dir ./output \
+    --resume ./output/best --cycles-done 128
+```
 
 ### Other backbones
 

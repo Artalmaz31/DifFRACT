@@ -20,19 +20,36 @@ class PromptStream:
         self.max_len = max_len
         self.dataset = load_dataset(dataset_id, config_name, split=split)
         self._iter = iter(self.dataset)
+        self._consumed = 0
 
     def get_prompts(self, n: int) -> List[str]:
         out: List[str] = []
         while len(out) < n:
             try:
                 item = next(self._iter)
+                self._consumed += 1
             except StopIteration:
                 self._iter = iter(self.dataset)
+                self._consumed = 0
                 continue
             txt = item.get(self.column, "")
             if txt and len(txt) > self.min_len:
                 out.append(txt[: self.max_len])
         return out
+
+    def advance(self, n_prompts: int) -> None:
+        taken = 0
+        while taken < n_prompts:
+            try:
+                item = next(self._iter)
+                self._consumed += 1
+            except StopIteration:
+                self._iter = iter(self.dataset)
+                self._consumed = 0
+                continue
+            txt = item.get(self.column, "")
+            if txt and len(txt) > self.min_len:
+                taken += 1
 
     def fixed_validation_batch(self, n: int = 512) -> List[str]:
         out: List[str] = []

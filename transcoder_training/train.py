@@ -1,5 +1,6 @@
 import os
 import random
+import warnings
 import diffusers
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Sequence, Tuple
@@ -76,6 +77,9 @@ class TrainConfig:
 
     save_dir: str = "./output"
     seed: int = 42
+
+    resume: Optional[str] = None
+    cycles_done: int = 0
 
     @classmethod
     def for_model(cls, name: str, **overrides) -> "TrainConfig":
@@ -163,6 +167,38 @@ def _check_trajectory_coverage(cfg):
         )
 
 
+def prompts_per_cycle(cfg: TrainConfig) -> int:
+    s_img = (cfg.height // 16) * (cfg.width // 16)
+    mul = 2 if runs_real_cfg(cfg.pipeline_cls, cfg.guidance_scale) else 1
+    rows_per_call = cfg.prompts_per_inference * mul * s_img * cfg.num_inference_steps
+    calls = -(-cfg.buffer_size // rows_per_call)
+    return calls * cfg.prompts_per_inference
+
+
+def warm_restart(cfg, role, models, schedulers, stream, weights_dir, cycles_done) -> None:
+    missing = [k for k in models if not os.path.exists(os.path.join(weights_dir, f"{role}_{k}.pt"))]
+    if missing:
+        raise FileNotFoundError(
+            f"{weights_dir} is missing " + ", ".join(f"{role}_{k}.pt" for k in missing)
+        )
+    for key, model in models.items():
+        state = torch.load(os.path.join(weights_dir, f"{role}_{key}.pt"), map_location="cpu")
+        model.load_state_dict(state)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for sched in schedulers.values():
+            for _ in range(cycles_done):
+                sched.step()
+
+    n_prompts = cycles_done * prompts_per_cycle(cfg)
+    stream.advance(n_prompts)
+    tqdm.write(
+        f"[resume] loaded {len(models)} dictionaries from {weights_dir}, "
+        f"continuing at cycle {cycles_done}/{cfg.total_cycles}..."
+    )
+
+
 def _move_optimizer_state(opt, device):
     for state in opt.state.values():
         for name, value in state.items():
@@ -232,7 +268,48 @@ def run_training(cfg: TrainConfig, role: str = "transcoder"):
     nsteps = cfg.buffer_size // cfg.batch_size
     best_val_cos = 0.0
 
-    for cycle in tqdm(range(cfg.total_cycles), desc=f"Training {role}"):
+    def _validate():
+        return run_validation(
+            pipe,
+            models,
+            keys,
+            val_prompts,
+            capturer,
+            t_ctx,
+            kind=role,
+            num_inference_steps=cfg.num_inference_steps,
+            device=cfg.device,
+            height=cfg.height,
+            width=cfg.width,
+            orig_dtype=cfg.dtype,
+            guidance_scale=cfg.guidance_scale,
+            prompt_aliases=cfg.prompt_aliases,
+            make_comparison_image=cfg.make_comparison_image,
+        )
+
+    start_cycle = 0
+    resume_from = cfg.resume
+    if resume_from is not None:
+        start_cycle = int(cfg.cycles_done)
+        if not 0 < start_cycle < cfg.total_cycles:
+            raise ValueError(
+                f"--cycles-done must be between 1 and {cfg.total_cycles - 1}, got {start_cycle}"
+            )
+        warm_restart(cfg, role, models, schedulers, stream, cfg.resume, start_cycle)
+        rng_cpu = torch.get_rng_state()
+        rng_cuda = torch.cuda.get_rng_state_all() if device_type == "cuda" else None
+        _, best_val_cos, _ = _validate()
+        torch.set_rng_state(rng_cpu)
+        if rng_cuda is not None:
+            torch.cuda.set_rng_state_all(rng_cuda)
+        tqdm.write(f"[resume] loaded weights score cos={best_val_cos:.4f}")
+
+    for cycle in tqdm(
+        range(start_cycle, cfg.total_cycles),
+        initial=start_cycle,
+        total=cfg.total_cycles,
+        desc=f"Training {role}",
+    ):
         reset_buffers(buffers)
 
         # harvest activations until the buffer is full
@@ -323,23 +400,7 @@ def run_training(cfg: TrainConfig, role: str = "transcoder"):
                 )
 
         if (cycle + 1) % cfg.val_every == 0:
-            val_mse, val_cos, val_image = run_validation(
-                pipe,
-                models,
-                keys,
-                val_prompts,
-                capturer,
-                t_ctx,
-                kind=role,
-                num_inference_steps=cfg.num_inference_steps,
-                device=cfg.device,
-                height=cfg.height,
-                width=cfg.width,
-                orig_dtype=cfg.dtype,
-                guidance_scale=cfg.guidance_scale,
-                prompt_aliases=cfg.prompt_aliases,
-                make_comparison_image=cfg.make_comparison_image,
-            )
+            val_mse, val_cos, val_image = _validate()
             tqdm.write(f"[val] cos={val_cos:.4f} mse={val_mse:.4f}")
             if val_image is not None:
                 val_image.save(os.path.join(cfg.save_dir, f"val_cycle_{cycle + 1}.png"))

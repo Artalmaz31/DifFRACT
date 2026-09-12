@@ -54,6 +54,8 @@ def build_parser(default_save_dir: str) -> argparse.ArgumentParser:
     p.add_argument("--stats-every", type=int, default=None)
     p.add_argument("--val-every", type=int, default=None)
     p.add_argument("--no-comparison-image", dest="make_comparison_image", action="store_false", default=None)
+    p.add_argument("--resume", default=None, metavar="DIR")
+    p.add_argument("--cycles-done", type=int, default=None)
 
     return p
 
@@ -110,6 +112,9 @@ def config_from_args(args) -> TrainConfig:
             save_dir=args.save_dir,
             device=args.device,
             seed=args.seed,
+
+            resume=args.resume,
+            cycles_done=args.cycles_done,
         )
     except ValueError as exc:
         raise SystemExit(f"{exc}\n\nKnown --model values: {', '.join(sorted(ARCHS))}")
